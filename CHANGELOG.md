@@ -2,6 +2,10 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased
+
+- Add: Perl support — `.pl`/`.pm` files (and `#!/usr/bin/perl` shebang scripts) extracted via tree-sitter-perl (#1788). Packages (including block form `package Foo { ... }` and mid-file package switches), subs, `use`/`require` imports with in-corpus re-pointing, and `@ISA`/`use parent`/`use base` inheritance are captured; calls resolve INFERRED through the shared package-aware second pass under a zero-edge ambiguity policy (a bare or same-named call that could bind to two packages emits no edge rather than a guess, mirroring the other cross-file resolvers' god-node guard). Method calls (`$obj->meth()`) and AUTOLOAD/symbolic refs are intentionally out of scope — without receiver types they are unresolvable and name-matching would wire spurious edges to same-named subs.
+
 ## 0.9.28 (2026-07-27)
 
 - Fix: incremental extraction no longer drops cross-file edges whose target file wasn't in the batch (#2211, #2213). Python relative imports and markdown reference links emitted absolute-path-derived target ids without the `target_file` stamp the incremental canonicalization needs, so a re-extracted file's imports/references dangled or vanished; both now stamp the resolved target and canonicalize to the root-relative node.
@@ -256,8 +260,6 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 - Fix: `build_from_json` is deterministic across process runs again (#1753, thanks @erasmust-dotcom). The ghost-node merge iterated `set(G.nodes())`, so which node survived a `(basename, label)` collision depended on CPython's per-process string-hash seed — rebuilding the same extraction JSON in a fresh process could silently pick a different canonical id (breaking the cluster→relabel workflow with a `KeyError` on an id that vanished). The Pass 1/Pass 2 loops now iterate in sorted order. Additionally, two non-AST (semantic) nodes sharing a key but from *different* files are now treated as distinct concepts and both survive (mirroring the AST/AST ambiguity guard #1257) instead of one arbitrarily merging away; a genuine same-file duplicate still collapses.
 
 - Fix: a Java field/parameter/return-type reference to a class whose simple name is shared by two modules no longer dangles on a sourceless phantom node (#1744, thanks @aviciot). Both same-named classes already survive as distinct path-scoped nodes, but the cross-module `references` edge was left pointing at a bare no-source stub because `_resolve_java_type_references` re-pointed `implements`/`inherits`/`imports` but not `references` — so a query about the referenced class could miss it. The Java resolver now disambiguates `references` by the importing file's `import` statement (falling back to same-package), mirroring the C# resolver, and drops the orphaned phantom.
-
-- Add: Perl support — `.pl`/`.pm` files (and `#!/usr/bin/perl` shebang scripts) extracted via tree-sitter-perl (#1788). Packages (including block form `package Foo { ... }` and mid-file package switches), subs, `use`/`require` imports with in-corpus re-pointing, and `@ISA`/`use parent`/`use base` inheritance are captured; calls resolve INFERRED through the shared package-aware second pass under a zero-edge ambiguity policy (a bare or same-named call that could bind to two packages emits no edge rather than a guess, mirroring the other cross-file resolvers' god-node guard). Method calls (`$obj->meth()`) and AUTOLOAD/symbolic refs are intentionally out of scope — without receiver types they are unresolvable and name-matching would wire spurious edges to same-named subs.
 
 ## 0.9.11 (2026-07-08)
 
