@@ -4239,3 +4239,327 @@ def test_perl_root_qualified_package_normalizes(tmp_path):
     labels = [n.get("label") for n in r["nodes"]]
     assert "::Outer" not in labels, "root-qualified spelling must be canonicalized"
     assert "Outer" in labels, "the package must surface under its canonical label"
+def test_perl_finds_imports():
+    """`use Module` / `require Module` become imports edges; the qw-list form
+    (`use Scalar::Util qw(blessed)`) and bareword `require` both count."""
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    assert "imports" in _relations(r)
+    import_edges = _edges_with_relation(r, "imports", "imports_from")
+    targets = " ".join(str(e.get("target", "")) for e in import_edges).lower()
+    assert "scalar" in targets or "util" in targets, "Scalar::Util import missing"
+    assert "carp" in targets, "Carp import missing"
+    assert "helper" in targets, "require Acme::Helper import missing"
+
+
+def test_perl_import_edges_have_import_context():
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    import_edges = _edges_with_relation(r, "imports", "imports_from")
+    assert import_edges
+    assert all(e.get("context") == "import" for e in import_edges)
+
+
+def test_perl_import_edges_are_extracted():
+    """`use`/`require` are literal in source -> EXTRACTED confidence."""
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    import_edges = _edges_with_relation(r, "imports", "imports_from")
+    assert import_edges
+    assert all(e.get("confidence") == "EXTRACTED" for e in import_edges)
+
+
+def test_perl_pragmas_not_imported():
+    """`use strict` / `use warnings` are pragmas, not module dependencies, and
+    must NOT create imports edges (matches the pragma-exclusion in other langs)."""
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    import_edges = _edges_with_relation(r, "imports", "imports_from")
+    targets = " ".join(str(e.get("target", "")) for e in import_edges).lower()
+    assert "strict" not in targets, "`use strict` pragma must not be an import"
+    assert "warnings" not in targets, "`use warnings` pragma must not be an import"
+
+
+def test_perl_isa_inherits_edge():
+    """`our @ISA = ('Acme::Base')` must emit an inherits edge to Acme::Base."""
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    found = any(
+        "Acme::Widget" in node_by_id.get(e["source"], "")
+        and "Acme::Base" in node_by_id.get(e["target"], "")
+        for e in r["edges"] if e["relation"] == "inherits"
+    )
+    assert found, "Acme::Widget should have inherits edge to Acme::Base (our @ISA)"
+
+
+def test_perl_use_parent_inherits_edge():
+    """`use parent -norequire, 'Acme::Role'` must emit an inherits edge; the
+    `-norequire` flag is not a parent."""
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    parents = {
+        node_by_id.get(e["target"], "")
+        for e in r["edges"] if e["relation"] == "inherits"
+        and "Acme::Widget" in node_by_id.get(e["source"], "")
+    }
+    assert any("Acme::Role" in p for p in parents), "use parent target Acme::Role missing"
+    assert not any("norequire" in p for p in parents), "-norequire flag must not be a parent"
+
+
+def test_perl_use_base_inherits_edge():
+    """`use base 'Acme::Mixin'` must emit an inherits edge to Acme::Mixin."""
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    parents = {
+        node_by_id.get(e["target"], "")
+        for e in r["edges"] if e["relation"] == "inherits"
+        and "Acme::Widget" in node_by_id.get(e["source"], "")
+    }
+    assert any("Acme::Mixin" in p for p in parents), "use base target Acme::Mixin missing"
+
+
+def test_perl_no_dangling_edges():
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"dangling edge source: {e}"
+
+
+def test_perl_inherit_stub_has_no_source_file():
+    """Inheritance parents defined outside this file (RTL / another module) must
+    not claim the child file as their source; they are external stubs with an
+    empty source_file (mirrors go/julia/objc)."""
+    from graphify.extract import extract_perl
+    r = extract_perl(FIXTURES / "sample_module.pm")
+    stubs = [n for n in r["nodes"]
+             if n["label"] in ("Acme::Base", "Acme::Role", "Acme::Mixin")]
+    assert stubs, "expected external inheritance stub nodes"
+    for n in stubs:
+        assert n.get("source_file") == "", (
+            f"external parent stub {n['label']!r} must have empty source_file, "
+            f"got {n.get('source_file')!r}"
+        )
+
+
+def test_perl_duplicate_use_dedup(tmp_path):
+    """Two identical `use Foo;` statements must dedup to a single imports edge."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "dup.pm"
+    src.write_text(
+        "package D;\n"
+        "use Foo;\n"
+        "use Foo;\n"
+        "1;\n"
+    )
+    r = extract_perl(src)
+    foo_imports = [e for e in r["edges"]
+                   if e["relation"] == "imports" and "foo" in str(e["target"]).lower()]
+    assert len(foo_imports) == 1, (
+        f"duplicate `use Foo;` must dedup to one edge, got {len(foo_imports)}: {foo_imports}"
+    )
+
+
+def test_perl_import_repoints_to_in_corpus_package(tmp_path):
+    """`use Acme::Helper;` from another file must re-point its imports edge onto
+    the real Acme::Helper package node (id `_make_id(stem, 'Acme::Helper')`),
+    not dangle on the bare module-label id `_make_id('Acme::Helper')`. An external
+    `use POSIX;` has no in-corpus package, so its edge keeps the bare (node-less)
+    target — mirroring how other languages leave external imports dangling."""
+    from graphify.extract import extract
+    from graphify.extractors.base import _make_id
+    (tmp_path / "helper.pm").write_text("package Acme::Helper;\nsub emit { return 1; }\n1;\n")
+    (tmp_path / "main.pm").write_text(
+        "package Main;\nuse Acme::Helper;\nuse POSIX qw(floor);\nsub run { return 1; }\n1;\n"
+    )
+    r = extract([tmp_path / "helper.pm", tmp_path / "main.pm"], parallel=False)
+    node_ids = {n["id"] for n in r["nodes"]}
+    pkg_nodes = [n for n in r["nodes"] if n.get("label") == "Acme::Helper"]
+    assert len(pkg_nodes) == 1, f"expected one Acme::Helper package node, got {pkg_nodes}"
+    pkg_id = pkg_nodes[0]["id"]
+    imports = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert any(e["target"] == pkg_id for e in imports), \
+        f"use Acme::Helper must re-point to package node {pkg_id}, got {[e['target'] for e in imports]}"
+    bare_helper = _make_id("Acme::Helper")
+    assert bare_helper != pkg_id
+    assert not any(e["target"] == bare_helper for e in imports), \
+        "the in-corpus import must no longer dangle on the bare module-label id"
+    posix_id = _make_id("POSIX")
+    assert any(e["target"] == posix_id for e in imports), "external POSIX import edge missing"
+    assert posix_id not in node_ids, \
+        "external POSIX must stay a dangling label-id stub, not become a node"
+
+
+
+def test_perl_require_repoints_to_in_corpus_package(tmp_path):
+    """`require Acme::Helper;` (bareword require form) re-points the same way as
+    `use` when the module is an in-corpus package."""
+    from graphify.extract import extract
+    (tmp_path / "helper.pm").write_text("package Acme::Helper;\nsub emit { return 1; }\n1;\n")
+    (tmp_path / "main.pm").write_text(
+        "package Main;\nrequire Acme::Helper;\nsub run { return 1; }\n1;\n"
+    )
+    r = extract([tmp_path / "helper.pm", tmp_path / "main.pm"], parallel=False)
+    pkg_id = next(n["id"] for n in r["nodes"] if n.get("label") == "Acme::Helper")
+    imports = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert any(e["target"] == pkg_id for e in imports), \
+        f"require Acme::Helper must re-point to package node {pkg_id}, got {[e['target'] for e in imports]}"
+
+
+
+def test_perl_import_duplicate_package_label_stays_dangling(tmp_path):
+    """A re-opened package declared under the SAME fully-qualified label in two
+    files (e.g. `package Assert;` in both AssertOn.pm and AssertOff.pm) is
+    ambiguous: a bare `use P::A;` cannot say which file it means. Binding it to
+    one file arbitrarily is a guessed edge — worse than dangling — so the imports
+    edge must stay on the bare module-label id (no package node) when >1 package
+    node carries the label. Only a unique label re-points (zero-edge over a guess)."""
+    from graphify.extract import extract
+    from graphify.extractors.base import _make_id
+    (tmp_path / "a1.pm").write_text("package P::A;\nsub emit { return 1; }\n1;\n")
+    (tmp_path / "a2.pm").write_text("package P::A;\nsub other { return 2; }\n1;\n")
+    (tmp_path / "c.pm").write_text(
+        "package C;\nuse P::A;\nsub run { return 1; }\n1;\n"
+    )
+    r = extract(
+        [tmp_path / "a1.pm", tmp_path / "a2.pm", tmp_path / "c.pm"], parallel=False
+    )
+    pkg_nodes = [n for n in r["nodes"] if n.get("label") == "P::A"]
+    assert len(pkg_nodes) == 2, f"expected two P::A package nodes, got {pkg_nodes}"
+    pkg_ids = {n["id"] for n in pkg_nodes}
+    imports = [e for e in r["edges"] if e["relation"] == "imports"]
+    bare_id = _make_id("P::A")
+    assert any(e["target"] == bare_id for e in imports), \
+        f"ambiguous use P::A; must stay dangling on bare id {bare_id}, got {[e['target'] for e in imports]}"
+    assert not any(e["target"] in pkg_ids for e in imports), \
+        f"ambiguous use P::A; must NOT bind to either P::A file node, got {[e['target'] for e in imports]}"
+
+
+
+def test_perl_import_repoints_from_shebang_perl_file(tmp_path):
+    """An extensionless `#!/usr/bin/perl` script is dispatched to extract_perl by
+    shebang, but its source_file has no .pl/.pm suffix. Scoping the re-pointer by
+    file suffix would silently skip such a file's imports (underreporting); scoping
+    by extractor provenance re-points them like any other Perl source."""
+    from graphify.extract import extract
+    (tmp_path / "helper.pm").write_text("package Acme::Helper;\nsub emit { return 1; }\n1;\n")
+    script = tmp_path / "runme"
+    script.write_text(
+        "#!/usr/bin/perl\npackage Main;\nuse Acme::Helper;\nsub run { return 1; }\n1;\n"
+    )
+    r = extract([tmp_path / "helper.pm", script], parallel=False)
+    pkg_id = next(n["id"] for n in r["nodes"] if n.get("label") == "Acme::Helper")
+    imports = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert any(e["target"] == pkg_id for e in imports), \
+        f"use Acme::Helper in a shebang-perl file must re-point to {pkg_id}, got {[e['target'] for e in imports]}"
+
+
+# ── Perl S6c review-finding regressions ────────────────────────────────────────
+
+
+def test_perl_import_repoint_survives_cache_roundtrip(tmp_path, monkeypatch):
+    """The import re-pointer must still fire on a cached (second) run (R2). A cached
+    fragment's source_file returns absolutized against the resolved root, so exact
+    string matching against the raw (relative) provenance paths missed and the
+    re-pointer silently regressed to dangling. Matching on the resolved path makes
+    both runs produce the same re-pointed edge."""
+    from graphify.extract import extract
+    monkeypatch.chdir(tmp_path)
+    Path("helper.pm").write_text("package Acme::Helper;\nsub emit { return 1; }\n1;\n")
+    Path("main.pm").write_text(
+        "package Main;\nuse Acme::Helper;\nsub run { return 1; }\n1;\n"
+    )
+    paths = [Path("helper.pm"), Path("main.pm")]
+
+    def _import_targets(r):
+        pkg_id = next(n["id"] for n in r["nodes"] if n.get("label") == "Acme::Helper")
+        return pkg_id, {e["target"] for e in r["edges"] if e["relation"] == "imports"}
+
+    r1 = extract(paths, cache_root=Path("."), parallel=False)
+    pkg1, targets1 = _import_targets(r1)
+    assert pkg1 in targets1, f"first run must re-point onto {pkg1}, got {targets1}"
+    assert (tmp_path / "graphify-out" / "cache").exists(), "AST cache must be written"
+
+    r2 = extract(paths, cache_root=Path("."), parallel=False)
+    pkg2, targets2 = _import_targets(r2)
+    assert pkg2 in targets2, \
+        f"cached run must ALSO re-point onto {pkg2} (not regress to dangling), got {targets2}"
+    assert targets1 == targets2, \
+        f"import targets must be identical across fresh and cached runs: {targets1} vs {targets2}"
+
+
+
+def test_perl_isa_rejects_non_package_string(tmp_path):
+    """@ISA holds arbitrary string content; a value that is not a well-formed
+    package name (markdown/brackets/control chars) must not become an inherits
+    stub node or edge (S2, zero-edge over a bogus label)."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "bad.pm"
+    src.write_text(
+        'package Child;\n'
+        'our @ISA = ("weird\\nname[x](y)");\n'
+        '1;\n'
+    )
+    r = extract_perl(src)
+    inherits = [e for e in r["edges"] if e["relation"] == "inherits"]
+    assert not inherits, f"malformed @ISA string must not create an inherits edge, got {inherits}"
+    bad = [n for n in r["nodes"]
+           if any(ch in n.get("label", "") for ch in ("[", "(", "\n"))]
+    assert not bad, f"no stub node from a malformed inheritance string, got {bad}"
+
+
+
+def test_perl_isa_valid_package_still_inherits(tmp_path):
+    """The S2 validation must not reject legitimate package names: a normal
+    `Foo::Bar` @ISA entry still produces an inherits edge + stub."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "ok.pm"
+    src.write_text(
+        'package Child;\n'
+        'our @ISA = ("Acme::Base");\n'
+        '1;\n'
+    )
+    r = extract_perl(src)
+    inherits = [e for e in r["edges"] if e["relation"] == "inherits"]
+    assert inherits, "a well-formed @ISA package must still inherit"
+    labels = {n.get("label") for n in r["nodes"]}
+    assert "Acme::Base" in labels, "the valid base class stub must be emitted"
+
+
+
+def test_perl_isa_digit_start_component_no_stub(tmp_path):
+    """End-to-end: a @ISA entry whose ::-component starts with a digit must not
+    produce an inherits edge or a stub node (F3 Unicode/digit-start bypass)."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "bad.pm"
+    src.write_text('package Child;\nour @ISA = ("Acme::1Base");\n1;\n')
+    r = extract_perl(src)
+    inherits = [e for e in r["edges"] if e["relation"] == "inherits"]
+    assert not inherits, f"digit-start component must not inherit, got {inherits}"
+    assert "Acme::1Base" not in {n.get("label") for n in r["nodes"]}, \
+        "no stub node for a digit-start component"
+
+
+
+def test_perl_string_parents_charges_budget(tmp_path, monkeypatch, caplog):
+    """`_string_parents` shares the traversal budget (F2): an @ISA array of many
+    separate string literals is a per-node walk that must trip the bounded warning,
+    even though the file has only a couple of top-level statements. The old code
+    left `_string_parents` entirely unbudgeted, so it walked the whole subtree for
+    free. (Each literal is its own tree node — unlike a single qw() word list.)"""
+    import logging
+    from graphify.extractors import perl
+    # Above the ~2 top-level statement charges but far below the string-literal node
+    # count, so exhaustion can only come from _string_parents.
+    monkeypatch.setattr(perl, "_MAX_PERL_TRAVERSAL_NODES", 20)
+    parents = ", ".join(f"'P{i}'" for i in range(400))
+    src = tmp_path / "wide_isa.pm"
+    src.write_text(f"package Child;\nour @ISA = ({parents});\n1;\n")
+    with caplog.at_level(logging.WARNING, logger="graphify.extractors.perl"):
+        perl.extract_perl(src)
+    assert any("traversal budget exhausted" in rec.message for rec in caplog.records), \
+        "a wide @ISA literal array must charge the shared budget via _string_parents"
+

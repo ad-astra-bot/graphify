@@ -1,10 +1,9 @@
 """Perl extractor: packages, subs, imports (use/require), inheritance (@ISA/parent/base).
 
-Deliberately untyped, consistent with the other language extractors. Calls are
-handed to the shared cross-file second pass as ``raw_calls`` (INFERRED by
-name-matching); method calls (``$obj->meth()``) are marked ``is_member_call`` so
-that pass drops them — without receiver types they are unresolvable and naive
-name-matching would wire spurious edges to same-named subs.
+Deliberately untyped, consistent with the other language extractors. This slice
+adds imports and inheritance on top of the package/sub extractor; calls are
+still handed to a later slice (the shared cross-file second pass consumes
+``raw_calls``, which are not collected here yet).
 """
 from __future__ import annotations
 
@@ -34,7 +33,7 @@ _PERL_PKG_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_
 _MAX_PERL_PKG_NAME_LEN = 256
 
 # Coarse guard so a pathologically large or deeply nested file cannot make the
-# (now iterative) tree walks run away; on exhaustion the file keeps whatever was
+# (iterative) tree walks run away; on exhaustion the file keeps whatever was
 # already extracted (file node + partial graph) instead of nothing.
 _MAX_PERL_TRAVERSAL_NODES = 2_000_000
 
@@ -56,34 +55,6 @@ _PERL_PRAGMAS: frozenset[str] = frozenset({
 
 # ``use parent`` / ``use base`` declare inheritance, not an import.
 _PERL_INHERIT_PRAGMAS: frozenset[str] = frozenset({"parent", "base"})
-
-# Perl builtins that surface as function_call_expression callees; excluding them
-# keeps them from accumulating spurious calls edges as god-nodes. Kept to the
-# canonical perlfunc core so a user sub that happens to share a name with a
-# builtin still resolves against real definitions in the corpus.
-_PERL_BUILTINS: frozenset[str] = frozenset({
-    # I/O & formatting
-    "print", "printf", "say", "sprintf", "open", "close", "read", "write",
-    "binmode", "eof", "seek", "tell", "sysread", "syswrite", "readline",
-    # process / system
-    "system", "exec", "fork", "wait", "waitpid", "kill", "sleep", "time",
-    "exit", "die", "warn",
-    # filesystem
-    "mkdir", "rmdir", "unlink", "rename", "chdir", "chmod", "chown", "stat",
-    "lstat", "opendir", "readdir", "closedir", "glob",
-    # list / hash ops
-    "shift", "unshift", "push", "pop", "splice", "map", "grep", "sort",
-    "reverse", "join", "split", "keys", "values", "each", "exists", "delete",
-    # string ops
-    "index", "rindex", "substr", "length", "uc", "lc", "ucfirst", "lcfirst",
-    "chomp", "chop", "chr", "ord", "hex", "oct", "pack", "unpack",
-    "quotemeta",
-    # math
-    "abs", "int", "sqrt", "sin", "cos", "atan2", "exp", "log", "rand", "srand",
-    # scalars / refs / types
-    "defined", "ref", "scalar", "bless", "return", "eval", "local", "my",
-    "our", "sub", "do", "require", "use", "no", "wantarray",
-})
 
 
 def extract_perl(path: Path) -> dict:
@@ -111,9 +82,6 @@ def extract_perl(path: Path) -> dict:
     # Dedup edges on their identity tuple so a repeated construct (e.g. two
     # `use Foo;` in one file) yields a single edge instead of parallel dups.
     seen_edges: set[tuple[str, str, str, str | None]] = set()
-    # sub_nid, body block, and the sub's enclosing package name (for the shared
-    # second pass's package-aware call resolution).
-    sub_bodies: list[tuple[str, Any, str | None]] = []
 
     def _text(node) -> str:
         return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
@@ -158,7 +126,15 @@ def extract_perl(path: Path) -> dict:
     def _package_name(node) -> str | None:
         """`package Foo::Bar;` -> the second `package`-typed child is the name."""
         names = [c for c in node.children if c.type == "package"]
-        return _text(names[1]) if len(names) >= 2 else None
+        name = _text(names[1]) if len(names) >= 2 else None
+        # Root-qualified spelling `::Outer` is the same package as `Outer`
+        # (::Name == main::Name in Perl); canonicalize so both spellings key to
+        # one package node instead of diverging on an empty qualifier.
+        if name and name.startswith("::"):
+            name = name[2:]
+        # The name comes from arbitrary source text; validate before it becomes a
+        # label (zero-node over a malformed or crafted package statement).
+        return name if _is_valid_perl_package_name(name or "") else None
 
     def _string_parents(node) -> list[str]:
         """Every string / qw-word parent named under an inheritance construct.
@@ -198,10 +174,9 @@ def extract_perl(path: Path) -> dict:
     def _ensure_main_pkg() -> str:
         """Perl's implicit default package. Code with no ``package`` statement lives
         in ``main``; modeling it explicitly (instead of hanging package-less subs off
-        the file node) means a qualified ``main::helper()`` call binds, and a bare
-        call from a package-less file is scoped to ``main`` — so it cannot be
-        mis-bound to a same-named sub in an unrelated package without import
-        evidence. Created lazily so a file with no package-less subs gets no empty
+        the file node) means a qualified ``main::helper()`` can bind once call
+        resolution lands, and a bare call from a package-less file has an honest
+        scope. Created lazily so a file with no package-less subs gets no empty
         ``main`` node."""
         nonlocal main_pkg_nid
         if main_pkg_nid is None:
@@ -308,39 +283,52 @@ def extract_perl(path: Path) -> dict:
                         else:
                             current_pkg_nid = pkg_nid
                             current_pkg_name = name
+                elif child.type == "block_statement":
+                    # A bare `{ ... }` scope may itself contain package/sub
+                    # declarations (`{ package Inner; sub f {...} }` is valid
+                    # Perl); descend without changing scope — the frame restores
+                    # whatever the enclosing package was once the block ends.
+                    stack.append((iter(child.children), current_pkg_nid, current_pkg_name))
+                    descended = True
+                    break
+                elif child.type == "phaser_statement":
+                    # BEGIN/CHECK/INIT/END/UNITCHECK blocks compile their bodies
+                    # at the surrounding scope, so declarations inside define real
+                    # symbols; descend into the phaser's block like any scope.
+                    blk = next((c for c in child.children if c.type == "block"), None)
+                    if blk is not None:
+                        stack.append((iter(blk.children), current_pkg_nid, current_pkg_name))
+                        descended = True
+                        break
                 elif child.type == "use_statement":
                     handle_use(child, line)
                 elif child.type == "subroutine_declaration_statement":
                     name = None
-                    block = None
                     for c in child.children:
                         if c.type == "bareword" and name is None:
                             name = _text(c)
-                        elif c.type == "block":
-                            block = c
                     if name:
                         if "::" in name:
                             # Qualified declaration `sub Pkg::sub {...}` defines the
                             # sub IN the named package, not the current one. Container
                             # = that package (created if it has no `package` statement
-                            # of its own); the body's caller-package is the qualifier
-                            # so its calls resolve against Pkg.
+                            # of its own).
                             pkg_qual, _, sub_name = name.rpartition("::")
-                            container = _make_id(stem, pkg_qual)
-                            add_node(container, pkg_qual, line)
-                            add_edge(file_nid, container, "contains", line)
-                            sub_package = pkg_qual
+                            if pkg_qual:
+                                container = _make_id(stem, pkg_qual)
+                                add_node(container, pkg_qual, line)
+                                add_edge(file_nid, container, "contains", line)
+                            else:
+                                # Root-qualified `sub ::foo {...}` declares
+                                # main::foo (::Name == main::Name).
+                                container = _ensure_main_pkg()
                         else:
-                            # Package-less sub → Perl's `main` (not the file node), so
-                            # `main::sub()` binds and bare same-file calls resolve.
+                            # Package-less sub → Perl's `main` (not the file node).
                             container = current_pkg_nid or _ensure_main_pkg()
                             sub_name = name
-                            sub_package = current_pkg_name or "main"
                         sub_nid = _make_id(container, sub_name)
                         add_node(sub_nid, f"{sub_name}()", line)
                         add_edge(container, sub_nid, "contains", line)
-                        if block is not None:
-                            sub_bodies.append((sub_nid, block, sub_package))
                 elif child.type == "expression_statement":
                     for c in child.children:
                         if c.type == "require_expression":
@@ -354,73 +342,9 @@ def extract_perl(path: Path) -> dict:
 
     walk_statements(root)
 
-    raw_calls: list[dict] = []
-
-    def walk_calls(root_node, caller_nid: str, caller_package: str | None) -> None:
-        # Iterative (see walk_statements): a deeply nested expression / data
-        # structure in a sub body would recurse once per level, and RecursionError
-        # here would drop the whole file via `_safe_extract`.
-        stack = [root_node]
-        while stack:
-            if not _spend():
-                break
-            node = stack.pop()
-            if node.type == "function_call_expression":
-                # Indirect-object constructor `new CLASS(...)` parses as
-                # ambiguous_function_call_expression(function 'new', function_call_expression
-                # 'CLASS()'); `new CLASS` == CLASS->new, an untyped member dispatch. Mark
-                # it a member call (edge-less) so it is not wired to a sub named CLASS.
-                parent = node.parent
-                indirect_new = (
-                    parent is not None
-                    and parent.type == "ambiguous_function_call_expression"
-                    and bool(parent.children)
-                    and parent.children[0].type == "function"
-                    and _text(parent.children[0]) == "new"
-                )
-                for c in node.children:
-                    if c.type == "function":
-                        # `Acme::Helper::emit` -> callee `emit`, callee_package
-                        # `Acme::Helper`; a bare `emit` -> callee `emit`, no package.
-                        # The qualifier + caller package let the shared second pass
-                        # bind to the right same-named sub instead of any `emit()`.
-                        parts = _text(c).split("::")
-                        callee = parts[-1]
-                        callee_package = "::".join(parts[:-1]) or None
-                        if callee and callee not in _PERL_BUILTINS:
-                            raw_calls.append({
-                                "caller_nid": caller_nid,
-                                "callee": callee,
-                                "callee_package": callee_package,
-                                "caller_package": caller_package,
-                                "is_member_call": indirect_new,
-                                "lang": "perl",
-                                "source_file": str_path,
-                                "source_location": f"L{node.start_point[0] + 1}",
-                            })
-                        break
-            elif node.type == "method_call_expression":
-                for c in node.children:
-                    if c.type == "method":
-                        callee = _text(c).split("::")[-1]
-                        if callee:
-                            raw_calls.append({
-                                "caller_nid": caller_nid,
-                                "callee": callee,
-                                "is_member_call": True,
-                                "lang": "perl",
-                                "source_file": str_path,
-                                "source_location": f"L{node.start_point[0] + 1}",
-                            })
-                        break
-            stack.extend(reversed(node.children))
-
-    for caller_nid, body, caller_package in sub_bodies:
-        walk_calls(body, caller_nid, caller_package)
-
     clean_edges = [e for e in edges if e["source"] in seen_ids and
                    (e["target"] in seen_ids or e["relation"] == "imports")]
-    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls,
+    return {"nodes": nodes, "edges": clean_edges,
             "input_tokens": 0, "output_tokens": 0}
 
 
@@ -448,11 +372,11 @@ def _resolve_perl_imports(
     to extract_perl by shebang and whose imports were never re-pointed
     (underreporting). When ``None`` (direct callers), falls back to suffix matching.
 
-    Runs AFTER the shared cross-file call pass: ``_has_package_import_evidence``
-    (extract.py) reads imports targets as bare module-label ids to bind a bare call
-    to an imported package's sub, so re-pointing before it would break that binding.
-    Mutates ``all_edges`` in place; the bare target was never a node, so there is
-    nothing to prune.
+    Runs AFTER the shared cross-file call pass (see the resolver registration in
+    extract.py): later slices' call binding reads imports targets as bare
+    module-label ids, so re-pointing before that would break the binding. Mutates
+    ``all_edges`` in place; the bare target was never a node, so there is nothing
+    to prune.
     """
     # Provenance matching must survive the cache round-trip. A fresh run stamps a
     # node's `source_file` with the raw `str(path)` the extractor was handed, which

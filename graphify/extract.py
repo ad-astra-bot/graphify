@@ -4156,10 +4156,10 @@ register_language_resolver(
 def _resolve_perl_imports_pass(per_file, all_nodes, all_edges, paths) -> None:
     """Re-point dangling in-corpus Perl ``imports`` edges onto the real package node.
 
-    Registered LAST so it runs after the shared cross-file call pass (which reads
-    the bare module-label ``use`` targets via ``_has_package_import_evidence``) and
-    after the member-call resolvers — the same position as its former inline call at
-    the tail of ``extract()``. Scoped by extractor PROVENANCE, not suffix: an
+    Registered LAST so it runs after the shared cross-file call pass — which in a
+    later slice reads the bare module-label ``use`` targets as import evidence for
+    call binding — and after the member-call resolvers. Scoped by extractor
+    PROVENANCE, not suffix: an
     extensionless ``#!/usr/bin/perl`` script is dispatched to ``extract_perl`` by
     shebang and must be re-pointed too, which is why it declares a custom
     ``activate`` predicate (a shebang-only corpus has no ``.pl``/``.pm`` suffix) and
@@ -6701,20 +6701,6 @@ def extract(
     _JS_TS_CALL_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
     _go_module_cache: dict[Path, str | None] = {}
 
-    # Enclosing-package label per node id, for the package-aware call resolution
-    # below. Only consulted for raw_calls that carry package qualifiers (Perl):
-    # a sub's direct container is its package node, whose label IS the package
-    # name (e.g. "Acme::Widget"), so the `contains` edge target->source gives
-    # sub_id -> package label. Other languages never set the package fields, so
-    # this map is built but never read for them.
-    _label_by_nid = {n["id"]: n.get("label", "") for n in all_nodes}
-    pkg_label_by_nid: dict[str, str] = {}
-    pkg_nid_by_sub_nid: dict[str, str] = {}
-    for e in all_edges:
-        if e.get("relation") == "contains":
-            pkg_label_by_nid[e["target"]] = _label_by_nid.get(e["source"], "")
-            pkg_nid_by_sub_nid[e["target"]] = e["source"]
-
     for rc in all_raw_calls:
         callee = rc.get("callee", "")
         if not callee:
@@ -6809,62 +6795,6 @@ def extract(
                 candidate_id in imported_symbols
                 or (candidate_file_nid is not None and candidate_file_nid in imported_modules)
             )
-
-        def _has_package_import_evidence(candidate_id: str) -> bool:
-            # Perl-only: `use P::A;` emits an imports edge to the MODULE label id
-            # (`_make_id('P::A')`), never to the sub id — so a bare call to an
-            # imported package's sub has no direct symbol/module evidence above.
-            # Bridge it: the candidate sub's enclosing package, re-idized the same
-            # way the `use` target is, must be among the caller file's imports.
-            pkg = pkg_label_by_nid.get(candidate_id, "")
-            if not pkg:
-                return False
-            if _make_id(pkg) in imported_symbols:
-                return True
-            # Accept the real package-node id form too. The import re-pointer rewrites
-            # a `use` target from the bare module-label id onto the package node id;
-            # matching either shape means this evidence check no longer depends on
-            # whether that re-pointer has run yet — the pass ordering stops being
-            # semantically load-bearing (A3). The current order (re-pointer after this
-            # pass) is kept regardless.
-            pkg_nid = pkg_nid_by_sub_nid.get(candidate_id)
-            return pkg_nid is not None and pkg_nid in imported_symbols
-
-        # Package-aware pre-filter for Perl, which tags every call with its
-        # enclosing package. Gated on the extractor-stamped `lang` (matching the
-        # cpp/csharp/java/objc raw-call consumers) rather than field-presence, so
-        # the branch claims exactly Perl's raw_calls and another language that
-        # happened to set a `*_package` field could never fall into it. Zero-edge
-        # over a wrong guess: an unresolvable qualifier or a foreign-package bare
-        # call is dropped, not bound to a same-named sub in the wrong package.
-        callee_package = rc.get("callee_package")
-        caller_package = rc.get("caller_package")
-        if rc.get("lang") == "perl":
-            if callee_package is not None:
-                # Qualified call `Pkg::sub()`: bind only to a sub whose enclosing
-                # package matches the qualifier. None or several -> drop.
-                candidates = [
-                    c for c in candidates
-                    if pkg_label_by_nid.get(c) == callee_package
-                ]
-            else:
-                # Bare call: prefer the caller's own package. If the sub is
-                # defined there, that's the target. Otherwise it can only be an
-                # imported sub — require unique import evidence, else drop (never
-                # bind a same-named sub from an unrelated package).
-                same_pkg = [
-                    c for c in candidates
-                    if pkg_label_by_nid.get(c) == caller_package
-                ]
-                if same_pkg:
-                    candidates = same_pkg
-                else:
-                    candidates = [
-                        c for c in candidates
-                        if _has_import_evidence(c) or _has_package_import_evidence(c)
-                    ]
-            if len(candidates) != 1:
-                continue
 
         if len(candidates) == 1:
             tgt = candidates[0]
