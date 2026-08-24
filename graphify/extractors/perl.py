@@ -251,19 +251,42 @@ def extract_perl(path: Path) -> dict:
             if c.type == "bareword":
                 add_edge(file_nid, _make_id(_text(c)), "imports", line, context="import")
                 return
+            if c.type in ("string_literal", "interpolated_string_literal"):
+                # Constant literal path: require "Foo/Bar.pm"; — normalize to the
+                # module-name spelling. Interpolated content ($x) stays skipped:
+                # it is not a static dependency.
+                for sc in c.children:
+                    if sc.type != "string_content":
+                        continue
+                    text_ = _text(sc)
+                    if "$" in text_ or "@" in text_:
+                        return
+                    name = text_
+                    if name.endswith(".pm"):
+                        name = name[:-3]
+                    name = name.replace("/", "::")
+                    if _is_valid_perl_package_name(name):
+                        add_edge(file_nid, _make_id(name), "imports", line,
+                                 context="import")
+                return
 
     def handle_isa(assign_node, line: int) -> None:
-        """`our @ISA = (...)` -> inherits edges to each named parent."""
-        # Package-less @ISA applies to implicit main, same as `use parent`.
-        target_pkg = current_pkg_nid or _ensure_main_pkg()
+        """`our @ISA = (...)` / bare `@ISA = (...)` -> inherits edges."""
         is_isa = False
         for child in assign_node.children:
             if child.type == "variable_declaration":
                 for sub in child.children:
                     if sub.type == "array" and _text(sub) == "@ISA":
                         is_isa = True
+            elif child.type == "array" and _text(child) == "@ISA":
+                # Without `our` (or split `our @ISA; @ISA = ...`), the array sits
+                # directly under the assignment.
+                is_isa = True
         if not is_isa:
             return
+        # Materialize implicit main only AFTER the assignment is confirmed as
+        # @ISA, so ordinary assignments in package-less files create no node.
+        target_pkg = current_pkg_nid or _ensure_main_pkg()
         for parent in _string_parents(assign_node):
             add_inherits(target_pkg, parent, line)
 
@@ -286,6 +309,21 @@ def extract_perl(path: Path) -> dict:
                 handle_require(n, n.start_point[0] + 1)
             else:
                 stack.extend(reversed(n.children))
+
+    def _scan_anonymous_subs(node) -> None:
+        """Find anonymous_subroutine_expression blocks anywhere under ``node``
+        and run the inner import scan on each."""
+        stack = [node]
+        while stack:
+            if not _spend():
+                return
+            n = stack.pop()
+            if n.type == "anonymous_subroutine_expression":
+                blk = next((g for g in n.children if g.type == "block"), None)
+                if blk is not None:
+                    _scan_inner_imports(blk)
+            else:
+                stack.extend(n.children)
 
     def walk_statements(root_node) -> None:
         nonlocal current_pkg_nid, current_pkg_name
@@ -330,11 +368,20 @@ def extract_perl(path: Path) -> dict:
                         else:
                             current_pkg_nid = pkg_nid
                             current_pkg_name = name
-                elif child.type == "block_statement":
-                    # A bare `{ ... }` scope may itself contain package/sub
-                    # declarations (`{ package Inner; sub f {...} }` is valid
-                    # Perl); descend without changing scope — the frame restores
-                    # whatever the enclosing package was once the block ends.
+                elif child.type in ("block_statement", "block"):
+                    # A bare `{ ... }` scope, a conditional/loop body block, or an
+                    # else-clause may itself contain declarations and imports
+                    # (`{ package Inner; sub f {...} }`, `if ($x) { require X; }`);
+                    # descend without changing scope — the frame restores whatever
+                    # the enclosing package was once the block ends.
+                    stack.append((iter(child.children), current_pkg_nid, current_pkg_name))
+                    descended = True
+                    break
+                elif child.type in ("conditional_statement", "while_statement",
+                                    "until_statement", "for_statement",
+                                    "foreach_statement", "c_style_for_statement"):
+                    # Compound constructs own their blocks as children; iterate the
+                    # construct so the block above picks up its body.
                     stack.append((iter(child.children), current_pkg_nid, current_pkg_name))
                     descended = True
                     break
@@ -387,6 +434,13 @@ def extract_perl(path: Path) -> dict:
                             handle_require(c, line)
                         elif c.type == "assignment_expression":
                             handle_isa(c, line)
+                            # An assignment can wrap an anonymous sub whose body
+                            # lazy-requires (`my $loader = sub { require X; }`).
+                            _scan_anonymous_subs(c)
+                        else:
+                            # Anonymous subs may sit deeper (my $loader = sub {
+                            # require X; }); their lazy imports are static deps.
+                            _scan_anonymous_subs(c)
             if descended:
                 continue
             stack.pop()

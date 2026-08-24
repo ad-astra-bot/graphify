@@ -4657,3 +4657,53 @@ def test_perl_repoint_admits_suffix_context_candidates(tmp_path):
     _resolve_perl_imports(nodes, edges, {"/abs/main.pl"})
     assert edges[0]["target"] == ctx_pkg_nid, \
         "an unchanged .pm package must remain a valid re-point candidate"
+
+def test_perl_bare_isa_assignment(tmp_path):
+    """`@ISA = qw(Base);` without `our` — the array sits directly under the
+    assignment — must still emit inherits."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "bareisa.pm"
+    src.write_text("package C;\n@ISA = qw(Acme::Base);\n1;\n")
+    r = extract_perl(src)
+    assert any(e["relation"] == "inherits" for e in r["edges"]), \
+        "bare @ISA assignment must emit inheritance"
+
+def test_perl_literal_path_require(tmp_path):
+    """`require \"Foo/Bar.pm\";` normalizes to the Foo::Bar module dependency."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "lit.pm"
+    src.write_text('package L;\nrequire "Foo/Bar.pm";\n1;\n')
+    r = extract_perl(src)
+    imports = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert any("foo_bar" in e["target"].lower() for e in imports), \
+        "constant literal-path require must normalize to a module import"
+
+def test_perl_conditional_require(tmp_path):
+    """`if ($x) { require Foo::Bar; }` at top level surfaces as an import."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "cond.pl"
+    src.write_text("if ($x) { require Foo::Bar; }\n")
+    r = extract_perl(src)
+    imports = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert any("foo_bar" in e["target"].lower() for e in imports), \
+        "a conditional lazy require must surface as a static dependency"
+
+def test_perl_anonymous_sub_require(tmp_path):
+    """`my $loader = sub { require Foo::Bar; };` surfaces as an import."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "anon.pm"
+    src.write_text("package A;\nmy $loader = sub { require Foo::Bar; };\n1;\n")
+    r = extract_perl(src)
+    imports = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert any("foo_bar" in e["target"].lower() for e in imports), \
+        "an anonymous-sub lazy require must surface as a static dependency"
+
+def test_perl_no_main_for_ordinary_packageless_assignment(tmp_path):
+    """A package-less file with only ordinary assignments must not mint an empty
+    `main` node (main is deferred until something needs it)."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "plain.pl"
+    src.write_text("$x = 1;\nprint $x;\n")
+    r = extract_perl(src)
+    labels = [n.get("label") for n in r["nodes"]]
+    assert "main" not in labels, "ordinary assignments must not materialize main"
