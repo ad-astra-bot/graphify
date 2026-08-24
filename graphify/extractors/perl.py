@@ -242,6 +242,16 @@ def extract_perl(path: Path) -> dict:
             for parent in parents:
                 add_inherits(target_pkg, parent, line)
             return
+        if module == "if":
+            # `use if CONDITION, 'Foo::Compat';` delegates the load to the `if`
+            # pragma, but the module argument is statically named — emit its
+            # import. The condition's scalar/number tokens don't match the
+            # collected shapes.
+            for parent in _string_parents(node):
+                if _is_valid_perl_package_name(parent):
+                    add_edge(file_nid, _make_id(parent), "imports", line,
+                             context="import")
+            return
         if module in _PERL_PRAGMAS:
             return
         add_edge(file_nid, _make_id(module), "imports", line, context="import")
@@ -268,6 +278,10 @@ def extract_perl(path: Path) -> dict:
                     if _is_valid_perl_package_name(name):
                         add_edge(file_nid, _make_id(name), "imports", line,
                                  context="import")
+                    # File-style literals (require "config.pl", "./Foo.pm")
+                    # would need file-node targets with corpus-relative path
+                    # resolution — deliberately deferred, not silently
+                    # mis-shaped into a package import.
                 return
 
     def handle_isa(assign_node, line: int) -> None:

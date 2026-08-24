@@ -4159,13 +4159,23 @@ def _resolve_perl_imports_pass(per_file, all_nodes, all_edges, paths) -> None:
     Registered LAST so it runs after the shared cross-file call pass — which in a
     later slice reads the bare module-label ``use`` targets as import evidence for
     call binding — and after the member-call resolvers. Scoped by extractor
-    PROVENANCE, not suffix: an
-    extensionless ``#!/usr/bin/perl`` script is dispatched to ``extract_perl`` by
-    shebang and must be re-pointed too, which is why it declares a custom
-    ``activate`` predicate (a shebang-only corpus has no ``.pl``/``.pm`` suffix) and
-    takes ``paths`` (``wants_paths``) to recompute that provenance set.
+    provenance over BOTH this run's paths AND the resolution context's source
+    files: on an incremental rebuild an unchanged package (extensionless
+    shebang-Perl included) must stay a re-point candidate, or full and
+    incremental graphs diverge.
     """
     perl_sources = {str(p) for p in paths if _get_extractor(p) is extract_perl}
+    seen_sf: set[str] = set()
+    for n in all_nodes:
+        sf = str(n.get("source_file") or "")
+        if not sf or sf in seen_sf:
+            continue
+        seen_sf.add(sf)
+        try:
+            if _get_extractor(Path(sf)) is extract_perl:
+                perl_sources.add(sf)
+        except Exception:
+            continue
     _resolve_perl_imports(all_nodes, all_edges, perl_sources)
 
 

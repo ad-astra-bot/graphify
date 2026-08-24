@@ -4707,3 +4707,14 @@ def test_perl_no_main_for_ordinary_packageless_assignment(tmp_path):
     r = extract_perl(src)
     labels = [n.get("label") for n in r["nodes"]]
     assert "main" not in labels, "ordinary assignments must not materialize main"
+
+def test_perl_use_if_delegates_import(tmp_path):
+    """`use if CONDITION, 'Foo::Compat';` — the `if` pragma's statically named
+    module argument becomes an import; the condition tokens don't."""
+    from graphify.extract import extract_perl
+    src = tmp_path / "useif.pm"
+    src.write_text("package U;\nuse if $] >= 5.010, 'Foo::Compat';\n1;\n")
+    r = extract_perl(src)
+    imports = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert any("foo_compat" in e["target"].lower() for e in imports), \
+        "the if-pragma's module argument must surface as an import"
