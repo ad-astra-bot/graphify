@@ -51,6 +51,7 @@ _PERL_PRAGMAS: frozenset[str] = frozenset({
     "strict", "warnings", "utf8", "constant", "vars", "lib", "feature",
     "integer", "bytes", "overload", "mro", "autodie", "diagnostics",
     "sort", "subs", "attributes", "fields", "encoding", "if", "less",
+    "open", "locale", "re", "experimental", "charnames", "sigtrap",
 })
 
 # ``use parent`` / ``use base`` declare inheritance, not an import.
@@ -137,11 +138,14 @@ def extract_perl(path: Path) -> dict:
         return name if _is_valid_perl_package_name(name or "") else None
 
     def _string_parents(node) -> list[str]:
-        """Every string / qw-word parent named under an inheritance construct.
+        """Every parent package named under an inheritance construct.
 
-        Reads string_literal (`'Foo'`) and quoted_word_list (`qw(Foo Bar)`)
-        content anywhere below ``node``; autoquoted barewords like ``-norequire``
-        are a different node type and are intentionally skipped.
+        A ``quoted_word_list`` (``qw(Foo Bar)``) is whitespace-separated and
+        yields one name per word. Ordinary string literals are SINGLE scalar
+        package names — their content is validated intact, never split (a
+        literal ``'Foo Bar'`` is one malformed name, not two parents).
+        Autoquoted barewords like ``-norequire`` are skipped here; bareword
+        parents are collected separately by ``handle_use``.
         """
         out: list[str] = []
         stack = [node]
@@ -149,11 +153,16 @@ def extract_perl(path: Path) -> dict:
             if not _spend():
                 break
             n = stack.pop()
-            if n.type in ("string_literal", "interpolated_string_literal", "quoted_word_list"):
+            if n.type == "quoted_word_list":
                 for c in n.children:
                     if c.type == "string_content":
                         out.extend(_text(c).split())
-                continue  # an inheritance string's own children are not parents
+                continue  # a qw-list's own children are not parents
+            if n.type in ("string_literal", "interpolated_string_literal"):
+                for c in n.children:
+                    if c.type == "string_content":
+                        out.append(_text(c))
+                continue
             stack.extend(reversed(n.children))
         return out
 
@@ -211,9 +220,27 @@ def extract_perl(path: Path) -> dict:
             return
         module = _text(pkgs[0])
         if module in _PERL_INHERIT_PRAGMAS:
-            if current_pkg_nid:
-                for parent in _string_parents(node):
-                    add_inherits(current_pkg_nid, parent, line)
+            # `use parent 'Foo'` in a package-less file applies to the implicit
+            # `main` package — materialize it rather than dropping the edge.
+            target_pkg = current_pkg_nid or _ensure_main_pkg()
+            parents = _string_parents(node)
+            # Bareword form: `use parent -norequire, Foo;` exposes Foo as a
+            # bareword — possibly nested in a list_expression. Collect validating
+            # barewords from the whole argument subtree; the -norequire flag is
+            # an autoquoted_bareword node (different type) and never matches.
+            bw_stack = [node]
+            while bw_stack:
+                if not _spend():
+                    break
+                bn = bw_stack.pop()
+                if bn.type == "bareword":
+                    bw = _text(bn)
+                    if not bw.startswith("-") and _is_valid_perl_package_name(bw):
+                        parents.append(bw)
+                else:
+                    bw_stack.extend(bn.children)
+            for parent in parents:
+                add_inherits(target_pkg, parent, line)
             return
         if module in _PERL_PRAGMAS:
             return
@@ -227,8 +254,8 @@ def extract_perl(path: Path) -> dict:
 
     def handle_isa(assign_node, line: int) -> None:
         """`our @ISA = (...)` -> inherits edges to each named parent."""
-        if not current_pkg_nid:
-            return
+        # Package-less @ISA applies to implicit main, same as `use parent`.
+        target_pkg = current_pkg_nid or _ensure_main_pkg()
         is_isa = False
         for child in assign_node.children:
             if child.type == "variable_declaration":
@@ -238,7 +265,27 @@ def extract_perl(path: Path) -> dict:
         if not is_isa:
             return
         for parent in _string_parents(assign_node):
-            add_inherits(current_pkg_nid, parent, line)
+            add_inherits(target_pkg, parent, line)
+
+    def _scan_inner_imports(block_node) -> None:
+        """Collect use/require statements nested INSIDE a sub body (lazy-loading
+
+        ``sub load { require Foo::Bar; }`` is a static dependency even though the
+        walker deliberately does not descend into sub bodies for declarations.
+        Walks all nested nodes iteratively under the shared budget, without
+        changing package scope — an inner statement's imports edge is sourced by
+        the file either way."""
+        stack = [block_node]
+        while stack:
+            if not _spend():
+                return
+            n = stack.pop()
+            if n is not block_node and n.type == "use_statement":
+                handle_use(n, n.start_point[0] + 1)
+            elif n.type == "require_expression":
+                handle_require(n, n.start_point[0] + 1)
+            else:
+                stack.extend(reversed(n.children))
 
     def walk_statements(root_node) -> None:
         nonlocal current_pkg_nid, current_pkg_name
@@ -304,9 +351,12 @@ def extract_perl(path: Path) -> dict:
                     handle_use(child, line)
                 elif child.type == "subroutine_declaration_statement":
                     name = None
+                    block = None
                     for c in child.children:
                         if c.type == "bareword" and name is None:
                             name = _text(c)
+                        elif c.type == "block":
+                            block = c
                     if name:
                         if "::" in name:
                             # Qualified declaration `sub Pkg::sub {...}` defines the
@@ -329,6 +379,8 @@ def extract_perl(path: Path) -> dict:
                         sub_nid = _make_id(container, sub_name)
                         add_node(sub_nid, f"{sub_name}()", line)
                         add_edge(container, sub_nid, "contains", line)
+                        if block is not None:
+                            _scan_inner_imports(block)
                 elif child.type == "expression_statement":
                     for c in child.children:
                         if c.type == "require_expression":
@@ -415,10 +467,23 @@ def _resolve_perl_imports(
     # same label across files (e.g. `package Assert;` in both AssertOn.pm and
     # AssertOff.pm), so we re-point ONLY when exactly one package node matches;
     # >1 candidate stays dangling (zero-edge over a guessed cross-file binding).
+    #
+    # Candidate eligibility: provenance set OR suffix. On an incremental rebuild
+    # the resolver's view includes UNCHANGED files' nodes (resolution context),
+    # which are not in `perl_source_files` (that set holds only the re-extracted
+    # paths) — a changed caller's `use` must still resolve against an unchanged
+    # package. The .pl/.pm suffix fallback admits those; an extensionless
+    # shebang-dispatched unchanged file remains out of reach (acceptable:
+    # candidates are package LABELS, which rarely collide across languages).
+    def _is_candidate_source(src: str) -> bool:
+        if perl_source_files is not None and src in resolved_perl_sources:
+            return True
+        return src.endswith((".pl", ".pm"))
+
     pkg_ids_by_label_id: dict[str, list[str]] = {}
     for node in all_nodes:
         src = str(node.get("source_file") or "")
-        if not _is_perl_source(src):
+        if not _is_candidate_source(src):
             continue
         label = node.get("label", "")
         nid = node.get("id", "")
